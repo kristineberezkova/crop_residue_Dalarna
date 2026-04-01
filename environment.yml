@@ -1,0 +1,16 @@
+name: crop_residue_dalarna
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - numpy
+  - pandas
+  - geopandas
+  - shapely
+  - rasterio
+  - tqdm
+  - pyarrow
+  - pip
+  - pip:
+      - phidown

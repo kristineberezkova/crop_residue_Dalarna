@@ -1,5 +1,4 @@
 import argparse
-import os
 import shutil
 import subprocess
 import logging
@@ -9,15 +8,23 @@ from datetime import datetime
 # =============================================================================
 # SNAP / PROCESSING CONSTANTS
 # =============================================================================
-DEM_NAME       = "Copernicus 30m Global DEM"
+DEM_NAME = "Copernicus 30m Global DEM"
 MAP_PROJECTION = "EPSG:32633"   # UTM 33N (Sweden)
+SUBSWATH = "IW3"                # default IW subswath
+
+# Coherence temporal baseline (days)
+MAX_TEMPORAL_BASELINE = 12
+
+# Time-of-day tolerance for same-track check (seconds)
+TRACK_TIME_TOLERANCE = 60
+
 
 # =============================================================================
 # CLI ARGUMENT PARSING
 # =============================================================================
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Process Sentinel-1 SLC interferometric coherence using SNAP GPT.",
+        description="Process Sentinel-1 SLC coherence using SNAP GPT.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument(
@@ -29,19 +36,11 @@ def parse_args():
         help="Root output directory (sub-folders created automatically)"
     )
     parser.add_argument(
-        "--subswath", default="IW3", choices=["IW1", "IW2", "IW3"],
+        "--subswath", default=SUBSWATH, choices=["IW1", "IW2", "IW3"],
         help="IW subswath to process"
     )
     parser.add_argument(
-        "--max-baseline", type=int, default=12,
-        help="Maximum temporal baseline in days for a valid coherence pair"
-    )
-    parser.add_argument(
-        "--track-tolerance", type=int, default=60,
-        help="Time-of-day tolerance in seconds for same-track check"
-    )
-    parser.add_argument(
-        "--tile-cache", default="4096M",
+        "--tile-cache", default="2048M",
         help="SNAP GPT tile cache size (e.g. 2048M, 4096M)"
     )
     parser.add_argument(
@@ -71,33 +70,28 @@ def setup_logging():
 # =============================================================================
 class CoherenceProcessor:
 
-    def __init__(self, input_dir, output_dir, subswath, max_baseline,
-                 track_tolerance, tile_cache, threads, logger):
+    def __init__(self, input_dir, output_dir, subswath, tile_cache, threads, logger):
         """
         Process interferometric coherence from Sentinel-1 SLC pairs.
 
         Args:
-            input_dir:       Directory containing S1 .zip or .SAFE files
-            output_dir:      Output directory for processed coherence
-            subswath:        IW subswath to process (IW1 / IW2 / IW3)
-            max_baseline:    Maximum temporal baseline in days
-            track_tolerance: Time-of-day tolerance in seconds for track check
-            tile_cache:      SNAP GPT tile cache string
-            threads:         Number of GPT worker threads
-            logger:          Python logger instance
+            input_dir: Directory containing S1 .zip or .SAFE files
+            output_dir: Output directory for processed coherence
+            subswath: IW subswath to process (IW1 / IW2 / IW3)
+            tile_cache: SNAP GPT tile cache string (e.g. '2048M')
+            threads: Number of GPT worker threads
+            logger: Python logger instance
         """
-        self.input_dir       = Path(input_dir)
-        self.output_dir      = Path(output_dir)
-        self.subswath        = subswath
-        self.max_baseline    = max_baseline
-        self.track_tolerance = track_tolerance
-        self.tile_cache      = tile_cache
-        self.threads         = threads
-        self.logger          = logger
+        self.input_dir = Path(input_dir)
+        self.output_dir = Path(output_dir)
+        self.subswath = subswath
+        self.tile_cache = tile_cache
+        self.threads = threads
+        self.logger = logger
 
         self.coherence_dir = self.output_dir / "coherence"
-        self.temp_dir      = self.output_dir / "temp_coherence"
-        self.graphs_dir    = self.output_dir / "graphs"
+        self.temp_dir = self.output_dir / "temp_coherence"
+        self.graphs_dir = self.output_dir / "graphs"
 
         for d in [self.coherence_dir, self.temp_dir, self.graphs_dir]:
             d.mkdir(parents=True, exist_ok=True)
@@ -119,7 +113,7 @@ class CoherenceProcessor:
     # -------------------------------------------------------------------------
     def find_products(self):
         """Find all Sentinel-1 products in input directory."""
-        products  = list(self.input_dir.glob("S1*.zip"))
+        products = list(self.input_dir.glob("S1*.zip"))
         products += [p for p in self.input_dir.glob("S1*.SAFE") if p.is_dir()]
         products.sort()
         self.logger.info(f"Found {len(products)} Sentinel-1 products")
@@ -133,11 +127,13 @@ class CoherenceProcessor:
         Extract acquisition date from product name.
 
         S1A_IW_SLC__1SDV_20240908T050700_20240908T050727_055569_06C843_F3CB.SAFE
-        parts[5] = start datetime → YYYYMMDD
+        parts: ['S1A','IW','SLC','','1SDV','20240908T050700','20240908T050727','055569','06C843','F3CB']
+                 [0]  [1]  [2] [3]  [4]         [5]                [6]           [7]      [8]    [9]
+        parts[5] = start datetime
         """
         try:
-            name     = product_path.stem.replace('.SAFE', '')
-            date_str = name.split('_')[5][:8]
+            name = product_path.stem.replace('.SAFE', '')
+            date_str = name.split('_')[5][:8]  # YYYYMMDD
             return datetime.strptime(date_str, "%Y%m%d")
         except Exception:
             self.logger.warning(f"Could not parse date from: {product_path.name}")
@@ -147,23 +143,28 @@ class CoherenceProcessor:
     def _same_track(self, product_a, product_b):
         """
         Check if two products are from the same orbit track by comparing
-        time-of-day of acquisition within self.track_tolerance seconds.
+        time-of-day of acquisition. Same track = same time of day within
+        TRACK_TIME_TOLERANCE seconds. More reliable than computing relative
+        orbit from absolute orbit number.
         """
         try:
             name_a = product_a.stem.replace('.SAFE', '')
             name_b = product_b.stem.replace('.SAFE', '')
 
+            # parts[5] = start datetime e.g. 20240908T050700
             time_a = datetime.strptime(name_a.split('_')[5], "%Y%m%dT%H%M%S")
             time_b = datetime.strptime(name_b.split('_')[5], "%Y%m%dT%H%M%S")
 
+            # Compare time-of-day in seconds only
             tod_a = time_a.hour * 3600 + time_a.minute * 60 + time_a.second
             tod_b = time_b.hour * 3600 + time_b.minute * 60 + time_b.second
 
             diff = abs(tod_a - tod_b)
             self.logger.info(
-                f"Time-of-day difference: {diff}s (tolerance: {self.track_tolerance}s)"
+                f"Time-of-day difference between products: {diff}s "
+                f"(tolerance: {TRACK_TIME_TOLERANCE}s)"
             )
-            return diff <= self.track_tolerance
+            return diff <= TRACK_TIME_TOLERANCE
 
         except Exception as e:
             self.logger.warning(f"Track check failed: {e}")
@@ -174,6 +175,9 @@ class CoherenceProcessor:
         """
         Create valid product pairs based on same track and temporal baseline.
 
+        Args:
+            products: List of product paths
+
         Returns:
             List of (master, slave) tuples
         """
@@ -181,26 +185,28 @@ class CoherenceProcessor:
 
         for i in range(len(products) - 1):
             master = products[i]
-            slave  = products[i + 1]
+            slave = products[i + 1]
 
-            self.logger.info(f"Evaluating pair: {master.name} — {slave.name}")
+            self.logger.info(f"Evaluating pair: {master.name} - {slave.name}")
 
+            # Check same track via time-of-day
             if not self._same_track(master, slave):
                 self.logger.info("Skipping pair (different tracks)")
                 continue
 
+            # Check temporal baseline
             master_date = self.parse_product_date(master)
-            slave_date  = self.parse_product_date(slave)
+            slave_date = self.parse_product_date(slave)
 
             if master_date and slave_date:
                 baseline_days = abs((slave_date - master_date).days)
 
-                if baseline_days <= self.max_baseline:
+                if baseline_days <= MAX_TEMPORAL_BASELINE:
                     pairs.append((master, slave))
                     self.logger.info(f"Valid pair ({baseline_days} days baseline)")
                 else:
                     self.logger.info(
-                        f"Skipping pair (baseline {baseline_days}d > {self.max_baseline}d)"
+                        f"Skipping pair (baseline {baseline_days}d > {MAX_TEMPORAL_BASELINE}d)"
                     )
 
         self.logger.info(f"Created {len(pairs)} valid coherence pairs")
@@ -282,7 +288,7 @@ class CoherenceProcessor:
     <operator>Back-Geocoding</operator>
     <sources>
       <sourceProduct refid="Split-M"/>
-      <sourceProduct refid="Split-S"/>
+      <sourceProduct.1 refid="Split-S"/>
     </sources>
     <parameters>
       <demName>{DEM_NAME}</demName>
@@ -381,7 +387,13 @@ class CoherenceProcessor:
 
     # -------------------------------------------------------------------------
     def run_graph(self, graph_xml, name):
-        """Execute SNAP GPT graph, streaming output line by line for monitoring."""
+        """
+        Execute SNAP GPT graph, streaming output line by line for monitoring.
+
+        Args:
+            graph_xml: XML graph content
+            name: Name for the graph file
+        """
         graph_file = self.graphs_dir / f"{name}.xml"
         graph_file.write_text(graph_xml, encoding="utf-8")
 
@@ -392,7 +404,9 @@ class CoherenceProcessor:
             "-q", str(self.threads)
         ]
 
-        self.logger.info(f"Running {name} (tile cache: {self.tile_cache}, threads: {self.threads})")
+        self.logger.info(
+            f"Running {name} (tile cache: {self.tile_cache}, threads: {self.threads})"
+        )
 
         try:
             process = subprocess.Popen(
@@ -421,26 +435,35 @@ class CoherenceProcessor:
 
     # -------------------------------------------------------------------------
     def process_coherence_pair(self, master, slave):
-        """Process a single coherence pair."""
-        timestamp   = datetime.now().strftime("%Y%m%d_%H%M%S")
+        """
+        Process a single coherence pair.
+
+        Args:
+            master: Path to master product
+            slave: Path to slave product
+
+        Returns:
+            Path to output file if successful, None otherwise
+        """
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_name = f"Coh_{master.stem[:25]}_{slave.stem[:25]}_{timestamp}.tif"
         output_file = self.coherence_dir / output_name
 
-        self.logger.info(f"Processing coherence pair:")
+        self.logger.info("Processing coherence pair:")
         self.logger.info(f"  Master:   {master.name}")
         self.logger.info(f"  Slave:    {slave.name}")
         self.logger.info(f"  Subswath: {self.subswath}")
         self.logger.info(f"  Output:   {output_file}")
 
         graph_xml = self.coherence_graph(master, slave, output_file)
-        success   = self.run_graph(graph_xml, f"coherence_{timestamp}")
+        success = self.run_graph(graph_xml, f"coherence_{timestamp}")
 
         if success and output_file.exists():
             self.logger.info(f"Output saved: {output_file}")
             return output_file
-        else:
-            self.logger.error(f"Failed to create output: {output_file}")
-            return None
+
+        self.logger.error(f"Failed to create output: {output_file}")
+        return None
 
     # -------------------------------------------------------------------------
     def process_all(self):
@@ -459,22 +482,22 @@ class CoherenceProcessor:
 
         results = []
         for i, (master, slave) in enumerate(pairs, 1):
-            self.logger.info(f"\n{'='*60}")
+            self.logger.info(f"\n{'=' * 60}")
             self.logger.info(f"Processing pair {i}/{len(pairs)}")
-            self.logger.info(f"{'='*60}")
+            self.logger.info(f"{'=' * 60}")
 
             output = self.process_coherence_pair(master, slave)
             results.append(output)
 
         successful = [r for r in results if r is not None]
-        self.logger.info(f"\n{'='*60}")
-        self.logger.info(f"COHERENCE PROCESSING COMPLETE")
-        self.logger.info(f"{'='*60}")
-        self.logger.info(f"Total pairs:  {len(pairs)}")
-        self.logger.info(f"Successful:   {len(successful)}")
-        self.logger.info(f"Failed:       {len(pairs) - len(successful)}")
-        self.logger.info(f"Output dir:   {self.coherence_dir}")
-        self.logger.info(f"{'='*60}\n")
+        self.logger.info(f"\n{'=' * 60}")
+        self.logger.info("COHERENCE PROCESSING COMPLETE")
+        self.logger.info(f"{'=' * 60}")
+        self.logger.info(f"Total pairs processed: {len(pairs)}")
+        self.logger.info(f"Successful:            {len(successful)}")
+        self.logger.info(f"Failed:                {len(pairs) - len(successful)}")
+        self.logger.info(f"Output directory:      {self.coherence_dir}")
+        self.logger.info(f"{'=' * 60}\n")
 
         return successful
 
@@ -483,30 +506,28 @@ class CoherenceProcessor:
         """Remove temporary files."""
         if self.temp_dir.exists():
             shutil.rmtree(self.temp_dir)
-            self.logger.info("Temporary files cleaned up")
+        self.logger.info("Temporary files cleaned up")
 
 
 # =============================================================================
 # MAIN
 # =============================================================================
 if __name__ == "__main__":
-    args   = parse_args()
+    args = parse_args()
     logger = setup_logging()
 
     processor = CoherenceProcessor(
-        input_dir       = args.input_dir,
-        output_dir      = args.output_dir,
-        subswath        = args.subswath,
-        max_baseline    = args.max_baseline,
-        track_tolerance = args.track_tolerance,
-        tile_cache      = args.tile_cache,
-        threads         = args.threads,
-        logger          = logger,
+        input_dir=args.input_dir,
+        output_dir=args.output_dir,
+        subswath=args.subswath,
+        tile_cache=args.tile_cache,
+        threads=args.threads,
+        logger=logger,
     )
 
     try:
         results = processor.process_all()
-        # processor.cleanup_temp()   # uncomment to remove temp files
+        # processor.cleanup_temp()  # uncomment to remove temp files after processing
     except Exception as e:
         logger.error(f"Processing failed: {e}", exc_info=True)
         raise
