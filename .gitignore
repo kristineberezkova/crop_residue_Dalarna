@@ -3,3 +3,10 @@ __pycache__/
 *.pyc
 .s5cfg
 *.log
+*.txt
+*.png
+*.jpg
+*.jpeg
+*.tif
+*.tiff
+Thumbs.db

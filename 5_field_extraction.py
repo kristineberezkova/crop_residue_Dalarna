@@ -85,7 +85,20 @@ def croptofield_with_mask(sentinelfile, maskfile, outfile):
             'compress': 'lzw'
         })
 
-    # Write output
+    # Skip writing if the resampled array contains only nodata (or only NaNs)
+    try:
+        nodata_is_nan = np.isnan(nodata)
+    except Exception:
+        nodata_is_nan = False
+
+    if nodata_is_nan:
+        if np.all(np.isnan(resampled)):
+            return False
+    else:
+        if not np.any(resampled != nodata):
+            return False
+
+    # Write output (create parent folder only for valid outputs)
     outfile.parent.mkdir(parents=True, exist_ok=True)
     with rasterio.open(outfile, 'w', **target_profile) as dst:
         dst.write(resampled)
