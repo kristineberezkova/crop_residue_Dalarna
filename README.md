@@ -311,8 +311,3 @@ If you hit memory pressure or instability, reduce cache and/or threads.
 	- Check raster coverage against field bounds.
 	- Ensure CRS consistency in source rasters and masks.
 
-
-## Notes
-
-- `convert_to_parquet.py` currently has local hardcoded paths and is intended as a quick utility.
-- The main pipeline scripts are CLI-based and machine-portable via arguments.
