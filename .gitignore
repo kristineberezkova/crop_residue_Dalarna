@@ -10,3 +10,7 @@ __pycache__/
 *.tif
 *.tiff
 Thumbs.db
+*.parquet
+*.parquet.gz
+.venv/
+convert_to_parquet.py

@@ -2,12 +2,12 @@
 
 This repository contains a Sentinel-1 processing pipeline for field-level crop residue analysis in Dalarna.
 
-The workflow does the following:
-- searches and downloads a valid Sentinel-1 SLC pair
-- processes backscatter (Gamma0 in dB)
-- processes interferometric coherence
-- initializes a per-field dataset layout with masks and geometry metadata
-- extracts per-field rasters from backscatter and coherence outputs
+Overview:
+- Search & download Sentinel-1 SLC products
+- Process backscatter (Gamma0 in dB)
+- Process interferometric coherence
+- Initialize per-field dataset (masks, aligned grids, parquet metadata)
+- Extract per-field rasters for analysis
 
 
 ## Repository Overview
@@ -40,11 +40,23 @@ The workflow does the following:
 	- Contains hardcoded paths and is not required if your fields file is already parquet.
 
 
+## Models
+
+The `models/` directory contains model definitions and helper utilities used for downstream analysis and experiments. These modules are optional for running the Sentinel-1 processing pipeline but useful if you plan to train or run ML models on the extracted field data.
+
+- `cnnencodernet.py`: convolutional encoder network (pixel/tile inputs).
+- `pixelsetencodernet.py`: encoder for pixel-set style inputs.
+- `temporal_encoder.py`: temporal encoding utilities and recurrent/transformer-based components.
+- `model_manager.py`: training, saving, and model loading helpers.
+
+See [models/README.md](models/README.md) for more details and examples on training and inference.
+
+
 ## Prerequisites
 
 ### 1. Python Environment
 
-This repo includes an environment file:
+The repository includes `environment.yml` for Conda. Use the Conda environment (recommended):
 
 ```powershell
 conda env create -f environment.yml
@@ -76,6 +88,8 @@ Make sure your environment is configured so `phidown` can authenticate.
 - ROI shapefile for scene search (`--roi`) in step 1.
 - Field polygons parquet for dataset initialization (`--fields_file`) in step 4.
 	- If your source is shapefile, convert to parquet first (either with GeoPandas or the helper script).
+
+Note: this repo contains a small helper `convert_to_parquet.py` intended for quick local conversions; it contains hardcoded paths and is meant as an example rather than a production utility.
 
 
 ## Recommended Folder Layout
